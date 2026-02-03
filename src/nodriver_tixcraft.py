@@ -33,6 +33,7 @@ import urllib.parse
 
 import util
 import settings
+import chrome_downloader
 from NonBrowser import NonBrowser
 
 try:
@@ -41,7 +42,7 @@ except Exception as exc:
     print(exc)
     pass
 
-CONST_APP_VERSION = "TicketsHunter (2026.01.24)"
+CONST_APP_VERSION = "TicketsHunter (2026.02.03)"
 
 
 CONST_MAXBOT_ANSWER_ONLINE_FILE = "MAXBOT_ONLINE_ANSWER.txt"
@@ -6923,8 +6924,33 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
             if show_debug_message:
                 print("JavaScript date selection click failed:", exc)
     else:
+        # Provide accurate error message based on actual condition
         if show_debug_message:
-            print("Vue.js not ready, skip clicking")
+            if not is_vue_ready:
+                print("[TicketPlus DATE] Vue.js not ready, waiting for page to load...")
+            elif not formated_area_list or len(formated_area_list) == 0:
+                print("[TicketPlus DATE] No available tickets (all sold out), waiting for refresh...")
+            else:
+                print("[TicketPlus DATE] Unknown condition, skip clicking")
+
+        # Auto reload when no available tickets and auto_reload_coming_soon_page is enabled
+        if auto_reload_coming_soon_page_enable and is_vue_ready and (not formated_area_list or len(formated_area_list) == 0):
+            try:
+                reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
+                if reload_interval > 0:
+                    if show_debug_message:
+                        print(f"[TicketPlus DATE] Waiting {reload_interval}s before auto-reload...")
+                    await asyncio.sleep(reload_interval)
+                else:
+                    await asyncio.sleep(1.0)  # Default 1 second delay
+
+                await tab.reload()
+                if show_debug_message:
+                    print("[TicketPlus DATE] Page reloaded, waiting for content...")
+                await asyncio.sleep(0.5)
+            except Exception as exc:
+                if show_debug_message:
+                    print(f"[TicketPlus DATE] Auto reload failed: {exc}")
 
     return is_date_clicked
 
@@ -21184,8 +21210,18 @@ def get_extension_config(config_dict, args=None):
         mcp_debug_enabled = True
         print("[MCP DEBUG] Mode enabled (via settings.json) - actual port will be shown after browser starts")
 
+    # Ensure Chrome is available (download if needed)
+    # This fixes Issue #236: NoDriver fails when Chrome is not installed
+    app_root = util.get_app_root()
+    webdriver_dir = os.path.join(app_root, "webdriver")
+    chrome_path = chrome_downloader.ensure_chrome_available(download_dir=webdriver_dir)
+    if not chrome_path:
+        print("[ERROR] Chrome not found and download failed.")
+        print("[ERROR] Please install Chrome manually or check your internet connection.")
+        raise FileNotFoundError("Could not find or download Chrome browser")
+
     # Normal mode: auto-detect (host=None, port=None) to let NoDriver start the browser
-    conf = Config(browser_args=browser_args, lang=default_lang, no_sandbox=no_sandbox, headless=config_dict["advanced"]["headless"])
+    conf = Config(browser_args=browser_args, lang=default_lang, no_sandbox=no_sandbox, headless=config_dict["advanced"]["headless"], browser_executable_path=chrome_path)
     if config_dict["advanced"]["chrome_extension"]:
         ext = get_maxbot_extension_path(CONST_MAXBOT_EXTENSION_NAME)
         if len(ext) > 0:
@@ -21411,6 +21447,51 @@ async def check_refresh_datetime_occur(tab, target_time):
             pass
 
     return is_refresh_datetime_sent
+
+async def reload_config(config_dict, last_mtime):
+    app_root = util.get_app_root()
+    config_filepath = os.path.join(app_root, CONST_MAXBOT_CONFIG_FILE)
+
+    if not os.path.exists(config_filepath):
+        return config_dict, last_mtime
+
+    try:
+        current_mtime = os.path.getmtime(config_filepath)
+        if current_mtime > last_mtime:
+            await asyncio.sleep(0.1)
+            with open(config_filepath, 'r', encoding='utf-8') as json_data:
+                new_config = json.load(json_data)
+
+                # Update fields
+                fields = [
+                    "ticket_number", "date_auto_select", "area_auto_select", "keyword_exclude",
+                    "ocr_captcha", "tixcraft", "kktix", "cityline",
+                    "refresh_datetime", "contact", "date_auto_fallback", "area_auto_fallback"
+                ]
+                for field in fields:
+                    if field in new_config:
+                        config_dict[field] = new_config[field]
+
+                if "advanced" in new_config:
+                    if "advanced" not in config_dict:
+                        config_dict["advanced"] = {}
+                    adv_fields = [
+                        "play_sound", "disable_adjacent_seat", "hide_some_image",
+                        "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
+                        "auto_reload_overheat_count", "auto_reload_overheat_cd",
+                        "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
+                        "discord_webhook_url", "discount_code"
+                    ]
+                    for field in adv_fields:
+                        if field in new_config["advanced"]:
+                            config_dict["advanced"][field] = new_config["advanced"][field]
+
+                print("Configuration reloaded from settings.json")
+                return config_dict, current_mtime
+    except Exception:
+        pass
+
+    return config_dict, last_mtime
 
 # ====================================================================================
 # HKTicketing Platform (hkticketing.com / galaxymacau.com / ticketek.com.au)
@@ -26139,8 +26220,17 @@ async def main(args):
     is_quit_bot = False
     is_refresh_datetime_sent = False
 
+    # Initialize config mtime
+    app_root = util.get_app_root()
+    config_filepath = os.path.join(app_root, CONST_MAXBOT_CONFIG_FILE)
+    config_mtime = 0
+    if os.path.exists(config_filepath):
+        config_mtime = os.path.getmtime(config_filepath)
+
     while True:
         await asyncio.sleep(0.05)
+
+        config_dict, config_mtime = await reload_config(config_dict, config_mtime)
 
         # pass if driver not loaded.
         if driver is None:
