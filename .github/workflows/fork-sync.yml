@@ -81,10 +81,16 @@ jobs:
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
           # 跳过已有的 Release
           if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
-            echo "跳过已存在 Release: $tag"
-            RELEASE_SKIP=$((RELEASE_SKIP+1))          # 统计跳过
+            echo "跳過已存在 Release: $tag"  # 檢查上游是否為 Latest，如果是就更新
+            isLatest=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json isLatest --jq '.isLatest')
+            if [ "$isLatest" = "true" ]; then
+              echo "更新 $tag 為 Latest"
+              gh release edit -R $FORK_REPO $tag --latest
+            fi
+            RELEASE_SKIP=$((RELEASE_SKIP+1))
             continue
           fi
+          
 
           echo "=== 同步 Release: $tag ==="
           # 下载上游 Release 的所有附件
