@@ -25,10 +25,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gh
 
-    - name: 登录 GH CLI(使用 GITHUB_TOKEN 或 自行添加 PAT_TOKEN)
+    - name: 登录 GH CLI
       run: |
-        echo "${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-        echo "GH_TOKEN=${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+        echo "${{ secrets.SYNC_TOKEN }}" | gh auth login --with-token
+        echo "GH_TOKEN=${{ secrets.SYNC_TOKEN }}" >> $GITHUB_ENV
 
     - name: checkout
       uses: actions/checkout@v4
