@@ -95,13 +95,15 @@ jobs:
           title=$(jq -r .name <<<"$release")
           body=$(jq -r .body <<<"$release")
           isPrerelease=$(jq -r .isPrerelease <<<"$release")
+          isLatest=$(jq -r .isLatest <<<"$release")
 
           if ! ls $TEMP_DIR/releases/* 1> /dev/null 2>&1; then
             # 尝试仅同步说明  创建 Release(不带附件)
             if gh release create -R $FORK_REPO $tag \
               --title "$title" \
               --notes "$body" \
-              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); then
+              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); \
+              $( [ "$isLatest" = "true" ] && echo "--latest" ); then
               RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1)) # 统计成功
             else
               echo "create Release $tag 失败，跳过"
@@ -112,7 +114,8 @@ jobs:
             if gh release create -R $FORK_REPO $tag $TEMP_DIR/releases/* \
               --title "$title" \
               --notes "$body" \
-              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); then
+              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); \
+              $( [ "$isLatest" = "true" ] && echo "--latest" ); then 
               RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1)) # 统计成功
             else
               echo "create Release $tag 失败，跳过"
