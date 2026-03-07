@@ -42,7 +42,7 @@ except Exception as exc:
     print(exc)
     pass
 
-CONST_APP_VERSION = "TicketsHunter (2026.02.15)"
+CONST_APP_VERSION = "TicketsHunter (2026.03.07)"
 
 CONST_MAXBOT_ANSWER_ONLINE_FILE = "MAXBOT_ONLINE_ANSWER.txt"
 CONST_MAXBOT_CONFIG_FILE = "settings.json"
@@ -85,6 +85,42 @@ warnings.simplefilter('ignore',InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig()
 logger = logging.getLogger('logger')
+
+def create_universal_ocr(config_dict):
+    """Create OCR instance using the universal captcha model based on settings.
+
+    Reads use_universal and path from config_dict["ocr_captcha"].
+    Returns ddddocr instance with universal model, or None if disabled or files not found.
+    """
+    use_universal = config_dict.get("ocr_captcha", {}).get("use_universal", True)
+    if not use_universal:
+        return None
+
+    ocr_path = config_dict.get("ocr_captcha", {}).get("path", "")
+    if not ocr_path:
+        return None
+
+    if not os.path.isabs(ocr_path):
+        ocr_path = os.path.join(util.get_app_root(), ocr_path)
+
+    onnx_path = os.path.join(ocr_path, "custom.onnx")
+    charsets_path = os.path.join(ocr_path, "charsets.json")
+    if not (os.path.exists(onnx_path) and os.path.exists(charsets_path)):
+        debug = util.create_debug_logger(config_dict)
+        debug.log(f"[OCR] Universal model files not found at: {ocr_path}")
+        return None
+
+    try:
+        return ddddocr.DdddOcr(
+            det=False, ocr=False, show_ad=False,
+            import_onnx_path=onnx_path,
+            charsets_path=charsets_path
+        )
+    except Exception as exc:
+        debug = util.create_debug_logger(config_dict)
+        debug.log(f"[OCR] Failed to load universal model: {exc}")
+        return None
+
 
 def get_config_dict(args):
     app_root = util.get_app_root()
@@ -183,6 +219,9 @@ def send_telegram_notification(config_dict, stage, platform_name):
     if bot_token and chat_id:
         verbose = adv.get("verbose", False)
         util.send_telegram_message_async(bot_token, chat_id, stage, platform_name, verbose=verbose)
+    elif bot_token or chat_id:
+        debug = util.create_debug_logger(config_dict)
+        debug.log("[Telegram] partial config: bot_token or chat_id is missing")
 
 async def nodriver_press_button(tab, select_query):
     if tab:
@@ -5151,18 +5190,22 @@ async def nodriver_ticket_number_select_fill(tab, select_obj, ticket_number, sel
                     return {{success: true, selected: "{ticket_number}"}};
                 }}
 
-                // 備用方案：設定為 "1"（同樣檢查是否可用）
-                const fallbackOption = Array.from(select.options).find(opt =>
-                    opt.value === "1" &&
+                // Fallback: select max available option instead of hardcoded "1"
+                const validOptions = Array.from(select.options).filter(opt =>
                     !opt.disabled &&
-                    !soldOutKeywords.includes(opt.value)
+                    !soldOutKeywords.includes(opt.value) &&
+                    parseInt(opt.value) > 0 &&
+                    !isNaN(parseInt(opt.value))
                 );
 
-                if (fallbackOption) {{
-                    select.value = "1";
-                    select.selectedIndex = fallbackOption.index;
+                if (validOptions.length > 0) {{
+                    const maxOption = validOptions.reduce((max, opt) =>
+                        parseInt(opt.value) > parseInt(max.value) ? opt : max
+                    );
+                    select.value = maxOption.value;
+                    select.selectedIndex = maxOption.index;
                     select.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return {{success: true, selected: "1"}};
+                    return {{success: true, selected: maxOption.value, fallback: true}};
                 }}
 
                 return {{success: false, error: "No valid options (all disabled or sold out)"}};
@@ -5175,7 +5218,7 @@ async def nodriver_ticket_number_select_fill(tab, select_obj, ticket_number, sel
             is_ticket_number_assigned = result.get('success', False)
 
     except Exception as exc:
-        print(f"Failed to set ticket number: {exc}")
+        logger.warning(f"Failed to set ticket number: {exc}")
 
     return is_ticket_number_assigned
 
@@ -5319,7 +5362,7 @@ async def nodriver_tixcraft_assign_ticket_number(tab, config_dict):
 
     if len(valid_ticket_types) == 0:
         debug.log("[TICKET SELECT] Warning: All ticket types are sold out or disabled")
-        return False, None
+        return False, None, None
 
     # Keyword matching logic (similar to area selection)
     matched_ticket = None
@@ -5500,7 +5543,7 @@ async def nodriver_tixcraft_ticket_main(tab, config_dict, ocr, Captcha_Browser, 
     else:
         # T026: Fix Issue #174 - reload page when ticket number cannot be set
         # This prevents infinite loop when desired ticket count is unavailable
-        print("[TICKET SELECT] Ticket count unavailable, reloading page to retry...")
+        debug.log("[TICKET SELECT] Ticket count unavailable, reloading page to retry...")
         try:
             # Wait based on auto_reload_page_interval setting
             interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
@@ -11012,7 +11055,8 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
         has_target_option = matched_ticket.get('hasTargetOption', False)
 
         # Determine which value to set
-        value_to_set = ticket_number if has_target_option else "1"
+        # If target not available, JS will find max available option
+        value_to_set = ticket_number if has_target_option else ""
 
         result = await tab.evaluate(f'''
             (function() {{
@@ -11034,8 +11078,24 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
                     return {{success: false, error: "SELECT not found in target row"}};
                 }}
 
+                let valueToSet = "{value_to_set}";
+
+                // If no preset value, find max available option
+                if (!valueToSet) {{
+                    const validOptions = Array.from(select.options).filter(opt =>
+                        parseInt(opt.value) > 0 && !isNaN(parseInt(opt.value))
+                    );
+                    if (validOptions.length === 0) {{
+                        return {{success: false, error: "No valid options available"}};
+                    }}
+                    const maxOpt = validOptions.reduce((max, opt) =>
+                        parseInt(opt.value) > parseInt(max.value) ? opt : max
+                    );
+                    valueToSet = maxOpt.value;
+                }}
+
                 // Set the value
-                select.value = "{value_to_set}";
+                select.value = valueToSet;
 
                 // Trigger events
                 select.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -11044,13 +11104,14 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
 
                 // Verify
                 const finalValue = select.value;
-                if (finalValue !== "{value_to_set}") {{
-                    return {{success: false, error: "Value verification failed", expected: "{value_to_set}", actual: finalValue}};
+                if (finalValue !== valueToSet) {{
+                    return {{success: false, error: "Value verification failed", expected: valueToSet, actual: finalValue}};
                 }}
 
                 return {{
                     success: true,
-                    set_value: "{value_to_set}",
+                    set_value: valueToSet,
+                    fallback: "{value_to_set}" === "",
                     ticket_name: row.querySelector('td:first-child')?.textContent.trim() || '',
                     verified: true
                 }};
@@ -12753,6 +12814,8 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
         ibon_dict["triggered_idle"] = False
         ibon_dict["shown_checkout_message"] = False
         ibon_dict["alert_handler_registered"] = False
+        ibon_dict["livemap_failed_areas"] = {}
+        ibon_dict["livemap_last_attempt"] = None
 
     # Check if kicked to login page (Cookie/Session expired)
     debug = util.create_debug_logger(config_dict)
@@ -13015,6 +13078,8 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                 # === live.map fast-path: skip DOM parsing by fetching area data from CDN ===
                 # Python requests bypasses browser network layer, unaffected by CDP blocking rules.
+                # NOTE: CDN remaining data can be stale (sold-out areas may show remaining > 0).
+                # A failed-area blacklist prevents infinite loops when CDN data is wrong.
                 try:
                     from urllib.parse import urlparse, parse_qs
                     parsed_url = urlparse(url)
@@ -13027,38 +13092,62 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                     if perf_id:
                         livemap_debug = util.create_debug_logger(config_dict)
+
+                        # Check if last fast-path attempt failed (we're back on area selection)
+                        last_attempt = ibon_dict.get("livemap_last_attempt")
+                        if last_attempt and last_attempt.get("perf_id") == perf_id:
+                            failed_area_id = last_attempt["area_id"]
+                            failed_area_name = last_attempt.get("area_name", "")
+                            failed_set = ibon_dict["livemap_failed_areas"].setdefault(perf_id, set())
+                            failed_set.add(failed_area_id)
+                            ibon_dict["livemap_last_attempt"] = None
+                            livemap_debug.log(f"[IBON LIVEMAP] Area '{failed_area_name}' (id={failed_area_id}) sold out, added to blacklist ({len(failed_set)} total)")
+
                         livemap_areas = util.ibon_fetch_and_parse_livemap(perf_id, livemap_debug)
 
                         if livemap_areas:
+                            # Filter out previously failed areas (stale CDN data)
+                            failed_set = ibon_dict["livemap_failed_areas"].get(perf_id, set())
+                            if failed_set:
+                                livemap_areas = [a for a in livemap_areas if a['area_id'] not in failed_set]
+                                livemap_debug.log(f"[IBON LIVEMAP] Filtered {len(failed_set)} failed areas, {len(livemap_areas)} remaining")
+
                             livemap_selected = None
 
-                            if len(area_keyword) > 0:
-                                livemap_kw_array = []
-                                try:
-                                    import json as _json
-                                    livemap_kw_array = _json.loads("[" + area_keyword + "]")
-                                except Exception:
+                            if livemap_areas:
+                                if len(area_keyword) > 0:
                                     livemap_kw_array = []
+                                    try:
+                                        import json as _json
+                                        livemap_kw_array = _json.loads("[" + area_keyword + "]")
+                                    except Exception:
+                                        livemap_kw_array = []
 
-                                for livemap_kw_item in livemap_kw_array:
-                                    livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, livemap_kw_item, debug=livemap_debug)
-                                    if livemap_selected:
-                                        break
-                            else:
-                                livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, area_keyword, debug=livemap_debug)
+                                    for livemap_kw_item in livemap_kw_array:
+                                        livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, livemap_kw_item, debug=livemap_debug)
+                                        if livemap_selected:
+                                            break
+                                else:
+                                    livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, area_keyword, debug=livemap_debug)
 
                             if livemap_selected:
                                 skip_url = util.ibon_build_skip_url(livemap_selected)
                                 livemap_debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} (remaining: {livemap_selected['remaining']}) -> {skip_url}")
                                 print(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} -> skip to next step")
+                                # Track this attempt so we can blacklist if it fails
+                                ibon_dict["livemap_last_attempt"] = {
+                                    "perf_id": perf_id,
+                                    "area_id": livemap_selected['area_id'],
+                                    "area_name": livemap_selected['area_name'],
+                                }
                                 await tab.get(skip_url)
                                 return False
                             else:
-                                livemap_debug.log("[IBON LIVEMAP] No matching area found, falling back to DOM flow")
+                                livemap_debug.log("[IBON LIVEMAP] No matching area after filtering, falling back to DOM flow")
                         else:
                             livemap_debug.log("[IBON LIVEMAP] No areas parsed, falling back to DOM flow")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    livemap_debug.log(f"[IBON LIVEMAP] Fast-path error: {exc}")
                 # === end live.map fast-path ===
 
                 is_need_refresh = False
@@ -13154,6 +13243,9 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                         return False  # Return to main loop to continue monitoring
 
+                    # Livemap fast-path area verified: has tickets, clear the attempt tracker
+                    ibon_dict["livemap_last_attempt"] = None
+
                     # Step 1: Handle non-adjacent seat checkbox
                     if config_dict["advanced"]["disable_adjacent_seat"]:
                         try:
@@ -13193,8 +13285,10 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         try:
                             # Initialize OCR instance
                             import ddddocr
-                            ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                            ocr.set_ranges(0)  # Restrict to digits only for ibon
+                            ocr = create_universal_ocr(config_dict)
+                            if ocr is None:
+                                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
+                                ocr.set_ranges(0)
 
                             is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
                         except Exception as exc:
@@ -13267,6 +13361,9 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                         return False  # Return to main loop to continue monitoring
 
+                    # Livemap fast-path area verified: has tickets, clear the attempt tracker
+                    ibon_dict["livemap_last_attempt"] = None
+
                     # Step 1: Handle non-adjacent seat checkbox
                     if config_dict["advanced"]["disable_adjacent_seat"]:
                         try:
@@ -13280,8 +13377,10 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         try:
                             # Initialize OCR instance
                             import ddddocr
-                            ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                            ocr.set_ranges(0)  # Restrict to digits only for ibon
+                            ocr = create_universal_ocr(config_dict)
+                            if ocr is None:
+                                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
+                                ocr.set_ranges(0)
 
                             is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
                         except Exception as exc:
@@ -22222,12 +22321,10 @@ async def nodriver_hkticketing_type02_date_assign(tab, config_dict):
                 if not is_date_assigned:
                     debug.log(f"[HKTICKETING TYPE02 DATE] Selected date does not match keyword, will select target date")
             elif selected_date_text and len(date_keyword) == 0:
-                # No keyword specified - only keep selection if date_auto_fallback is enabled
-                if date_auto_fallback:
-                    is_date_assigned = True
-                    debug.log(f"[HKTICKETING TYPE02 DATE] No keyword, date_auto_fallback=true, keeping current selection")
-                else:
-                    debug.log(f"[HKTICKETING TYPE02 DATE] No keyword, date_auto_fallback=false, will select based on mode")
+                # No keyword = any date is acceptable. Keep current selection unconditionally.
+                # Matches Type01 area "already selected" pattern (line 21279-21298).
+                is_date_assigned = True
+                debug.log(f"[HKTICKETING TYPE02 DATE] No keyword, keeping current selection: {selected_date_text}")
 
             if not is_date_assigned and len(dates_data) > 0:
                 # Get actual elements for clicking
@@ -23431,7 +23528,7 @@ async def nodriver_funone_verify_login(tab, config_dict):
 
 async def nodriver_funone_close_popup(tab):
     """
-    Close cookie consent and announcement popups
+    Close cookie consent, login modal, and announcement popups
 
     Returns:
         bool: True if any popup was closed
@@ -23444,25 +23541,79 @@ async def nodriver_funone_close_popup(tab):
         (function() {
             let closed = 0;
 
-            // Close cookie consent
-            const cookieButtons = document.querySelectorAll('button, a');
-            for (const btn of cookieButtons) {
-                const text = (btn.textContent || '').toLowerCase();
-                if (text.includes('accept') || text.includes('got it') || text.includes('ok') || text.includes('close')) {
-                    if (btn.closest('.cookie') || btn.closest('[class*="consent"]') || btn.closest('[class*="popup"]')) {
+            // Priority 0: Age confirmation modal (must click confirm, NOT close/return)
+            const ageModal = document.querySelector('.activity_aged_18_limit_modal');
+            if (ageModal) {
+                const confirmBtn = ageModal.querySelector('.btn-primary');
+                if (confirmBtn) {
+                    confirmBtn.click();
+                    return 1;
+                }
+            }
+
+            // Priority 1: FunOne login modal (close button)
+            const loginModalClose = document.querySelector('button.modal_close');
+            if (loginModalClose) {
+                const style = window.getComputedStyle(loginModalClose);
+                if (style.display !== 'none' && style.visibility !== 'hidden') {
+                    loginModalClose.click();
+                    closed++;
+                    return closed;
+                }
+            }
+
+            // Priority 2: FunOne login modal (return button as fallback)
+            const modalAction = document.querySelector('.modal_action');
+            if (modalAction) {
+                const buttons = modalAction.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim();
+                    if (text.includes('返回') || text.toLowerCase().includes('back') || text.toLowerCase().includes('cancel')) {
                         btn.click();
                         closed++;
+                        return closed;
                     }
                 }
             }
 
-            // Close modal dialogs with close button
-            const closeIcons = document.querySelectorAll('[class*="close"], [aria-label="close"], .modal button');
+            // Priority 3: Generic modal close buttons
+            const closeIcons = document.querySelectorAll('[class*="close"], [aria-label="close"]');
             for (const icon of closeIcons) {
                 const style = window.getComputedStyle(icon);
                 if (style.display !== 'none' && style.visibility !== 'hidden') {
                     icon.click();
                     closed++;
+                    return closed;
+                }
+            }
+
+            // Priority 4: Cookie consent banner (FunOne specific)
+            // Look for "同意" button in cookie context
+            const allButtons = document.querySelectorAll('button');
+            for (const btn of allButtons) {
+                const text = (btn.textContent || '').trim();
+                const style = window.getComputedStyle(btn);
+                if ((text === '同意' || text.toLowerCase() === 'agree' || text.toLowerCase() === 'accept') &&
+                    style.display !== 'none' && style.visibility !== 'hidden') {
+                    // Verify it's in a cookie/consent context
+                    const parent = btn.closest('div');
+                    if (parent && (parent.textContent.includes('Cookie') || parent.textContent.includes('cookie'))) {
+                        btn.click();
+                        closed++;
+                        return closed;
+                    }
+                }
+            }
+
+            // Priority 5: Generic cookie consent (fallback)
+            const cookieButtons = document.querySelectorAll('button, a');
+            for (const btn of cookieButtons) {
+                const text = (btn.textContent || '').toLowerCase();
+                if (text.includes('accept') || text.includes('got it') || text.includes('ok')) {
+                    if (btn.closest('.cookie') || btn.closest('[class*="consent"]') || btn.closest('[class*="popup"]')) {
+                        btn.click();
+                        closed++;
+                    }
                 }
             }
 
@@ -23523,9 +23674,28 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
         get_sessions_js = '''
         (function() {
             const sessions = [];
-            // Look for session buttons/options
-            const buttons = document.querySelectorAll('button, [role="button"], .session-item, [class*="session"], [class*="date"]');
 
+            // Priority 1: Look for FunOne-specific round_info divs (session containers)
+            const roundInfos = document.querySelectorAll('.round_info, .round_info--js');
+            if (roundInfos.length > 0) {
+                for (const container of roundInfos) {
+                    // Get session info from .info div inside container
+                    const infoDiv = container.querySelector('.info');
+                    const text = infoDiv ? infoDiv.textContent.trim() : container.textContent.trim();
+                    const isDisabled = container.classList.contains('disabled') || container.classList.contains('sold-out');
+
+                    if (!isDisabled && text.length > 3) {
+                        sessions.push({
+                            text: text,
+                            index: sessions.length
+                        });
+                    }
+                }
+                return sessions;
+            }
+
+            // Priority 2: Fallback to generic button search (for other layouts)
+            const buttons = document.querySelectorAll('button, [role="button"], .session-item, [class*="session"], [class*="date"]');
             for (const btn of buttons) {
                 const text = btn.textContent || '';
                 const isDisabled = btn.disabled || btn.classList.contains('disabled') || btn.classList.contains('sold-out');
@@ -23547,6 +23717,24 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
         '''
         sessions = await tab.evaluate(get_sessions_js)
 
+        # Parse CDP format if needed
+        # NoDriver may return format: {'type': 'object', 'value': [['key', {'type': 'string', 'value': 'val'}], ...]}
+        if sessions:
+            parsed_sessions = []
+            for s in sessions:
+                if isinstance(s, dict) and 'type' in s and s['type'] == 'object' and 'value' in s:
+                    # Parse CDP object format
+                    obj = {}
+                    for pair in s['value']:
+                        if isinstance(pair, list) and len(pair) == 2:
+                            key, val_dict = pair
+                            if isinstance(val_dict, dict) and 'value' in val_dict:
+                                obj[key] = val_dict['value']
+                    parsed_sessions.append(obj)
+                else:
+                    parsed_sessions.append(s)
+            sessions = parsed_sessions
+
         if not sessions or len(sessions) == 0:
             debug.log("[FUNONE] No sessions found")
             return False
@@ -23560,7 +23748,7 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
             keywords = util.parse_keyword_string_to_array(date_keyword)
 
             for i, session in enumerate(sessions):
-                session_text = session.get('text', '')
+                session_text = session.get('text', '') if isinstance(session, dict) else str(session)
                 for kw in keywords:
                     if kw.lower() in session_text.lower():
                         target_index = i
@@ -23582,9 +23770,33 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
         if target_index < 0 or target_index >= len(sessions):
             target_index = 0
 
-        # Click the selected session
+        # Click the selected session's next button
         click_session_js = f'''
         (function() {{
+            // Priority 1: FunOne-specific round_info divs
+            const roundInfos = document.querySelectorAll('.round_info, .round_info--js');
+            if (roundInfos.length > 0) {{
+                const sessionContainers = [];
+                for (const container of roundInfos) {{
+                    const isDisabled = container.classList.contains('disabled') || container.classList.contains('sold-out');
+                    if (!isDisabled) {{
+                        sessionContainers.push(container);
+                    }}
+                }}
+
+                if (sessionContainers.length > {target_index}) {{
+                    // Find the "下一步" button inside the selected session container
+                    const selectedContainer = sessionContainers[{target_index}];
+                    const nextBtn = selectedContainer.querySelector('button');
+                    if (nextBtn) {{
+                        nextBtn.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }}
+
+            // Priority 2: Fallback to generic button search
             const sessions = [];
             const buttons = document.querySelectorAll('button, [role="button"], .session-item, [class*="session"], [class*="date"]');
 
@@ -23610,29 +23822,9 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
         clicked = await tab.evaluate(click_session_js)
 
         if clicked:
-            debug.log(f"[FUNONE] Session {target_index} clicked")
+            debug.log(f"[FUNONE] Session {target_index} next button clicked")
             await tab.sleep(0.5)
-
-            # Click next button
-            click_next_js = '''
-            (function() {
-                const buttons = document.querySelectorAll('button, a');
-                for (const btn of buttons) {
-                    const text = (btn.textContent || '').trim();
-                    if (text === '下一步' || text === 'Next' || text.includes('下一步')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            })()
-            '''
-            next_clicked = await tab.evaluate(click_next_js)
-
-            if next_clicked:
-                debug.log("[FUNONE] Next button clicked")
-
-            return next_clicked
+            return True
 
         return False
 
@@ -24374,20 +24566,64 @@ async def nodriver_funone_captcha_handler(tab, config_dict):
 
         # Try OCR if enabled and we have base64 data
         if ocr_enabled and captcha_info.get('type') == 'base64' and captcha_info.get('base64Data'):
-            # Use first 100 chars of base64 as fingerprint to detect image change
-            current_captcha_fingerprint = captcha_info.get('base64Data', '')[:100]
-            last_fingerprint = funone_dict.get("last_captcha_fingerprint", "")
+            # Skip if already exhausted retries for this page
+            if funone_dict.get("ocr_exhausted", False):
+                if not funone_dict.get("waiting_captcha_printed"):
+                    debug.log("[FUNONE] OCR retries exhausted, waiting for manual captcha input...")
+                    funone_dict["waiting_captcha_printed"] = True
+                return False
 
-            # Reset OCR failed flag if captcha image changed
-            if current_captcha_fingerprint != last_fingerprint:
-                funone_dict["last_captcha_fingerprint"] = current_captcha_fingerprint
-                funone_dict["ocr_failed"] = False
+            max_retries = 5
+            retry_count = funone_dict.get("ocr_retry_count", 0)
 
-            # Only attempt OCR if not already failed for this captcha
-            if not funone_dict.get("ocr_failed", False):
-                ocr_result = await nodriver_funone_ocr_captcha(tab, config_dict, captcha_info.get('base64Data'))
+            # First attempt with current image
+            ocr_result = await nodriver_funone_ocr_captcha(tab, config_dict, captcha_info.get('base64Data'))
+            if ocr_result:
+                funone_dict["ocr_retry_count"] = 0
+                return True
+
+            # OCR failed - retry with reload
+            while retry_count < max_retries:
+                retry_count += 1
+                funone_dict["ocr_retry_count"] = retry_count
+                debug.log(f"[FUNONE OCR] Retry {retry_count}/{max_retries} - reloading captcha")
+
+                # Click reload button to get new captcha image
+                reload_ok = await nodriver_funone_reload_captcha(tab)
+                if not reload_ok:
+                    debug.log("[FUNONE OCR] Could not reload captcha")
+                    break
+
+                # Wait for new image to load
+                await asyncio.sleep(0.5)
+
+                # Get new captcha image
+                new_captcha_js = '''
+                (function() {
+                    const img = document.querySelector('img[alt="vCode"]');
+                    if (img && img.src && img.src.startsWith('data:image')) {
+                        return { base64Data: img.src };
+                    }
+                    return null;
+                })()
+                '''
+                new_info = await tab.evaluate(new_captcha_js)
+                new_info = util.parse_nodriver_result(new_info)
+
+                if not new_info or not isinstance(new_info, dict) or not new_info.get('base64Data'):
+                    debug.log("[FUNONE OCR] Could not get new captcha image")
+                    continue
+
+                # Retry OCR with new image
+                ocr_result = await nodriver_funone_ocr_captcha(tab, config_dict, new_info.get('base64Data'))
                 if ocr_result:
+                    funone_dict["ocr_retry_count"] = 0
                     return True
+
+            # All retries exhausted
+            if retry_count >= max_retries:
+                debug.log(f"[FUNONE OCR] Failed after {max_retries} retries, please enter manually")
+                funone_dict["ocr_exhausted"] = True
 
         # Only print waiting message once
         if not funone_dict.get("waiting_captcha_printed"):
@@ -24398,6 +24634,37 @@ async def nodriver_funone_captcha_handler(tab, config_dict):
     except Exception as exc:
         debug.log(f"[FUNONE] Captcha check error: {exc}")
         return False
+
+async def nodriver_funone_reload_captcha(tab):
+    """Click the captcha reload button to get a new image"""
+    try:
+        reload_js = '''
+        (function() {
+            // FunOne reload button: button.captcha_reload_btn or button next to img[alt="vCode"]
+            var btn = document.querySelector('button.captcha_reload_btn');
+            if (!btn) {
+                var img = document.querySelector('img[alt="vCode"]');
+                if (img) {
+                    var sibling = img.nextElementSibling;
+                    if (sibling && sibling.tagName === 'BUTTON') btn = sibling;
+                    if (!btn && img.parentElement) {
+                        btn = img.parentElement.querySelector('button');
+                    }
+                }
+            }
+            if (btn) {
+                btn.click();
+                return true;
+            }
+            return false;
+        })()
+        '''
+        result = await tab.evaluate(reload_js)
+        result = util.parse_nodriver_result(result)
+        return bool(result)
+    except Exception:
+        return False
+
 
 async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
     """
@@ -24426,24 +24693,27 @@ async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
 
         debug.log(f"[FUNONE OCR] Image size: {len(img_bytes)} bytes")
 
-        # Use cached OCR instance or create new one (beta mode best for FunOne)
-        # Cache in funone_dict to avoid recreating on every call
+        # Use cached OCR instance or create new one
+        # IMPORTANT: beta=False required for set_ranges to work
+        # set_ranges(5) = uppercase A-Z + 0-9 (FunOne captcha charset)
         if "ocr_instance" not in funone_dict:
-            funone_dict["ocr_instance"] = ddddocr.DdddOcr(show_ad=False, beta=True)
+            ocr_obj = ddddocr.DdddOcr(show_ad=False, beta=False)
+            ocr_obj.set_ranges(5)
+            funone_dict["ocr_instance"] = ocr_obj
         ocr_instance = funone_dict["ocr_instance"]
         ocr_answer = ocr_instance.classification(img_bytes)
 
         if ocr_answer:
-            # FunOne captcha is case-sensitive and uses uppercase letters
-            ocr_answer = ocr_answer.upper()
+            # Filter to uppercase A-Z and digits 0-9 only
+            # set_ranges(5) doesn't perfectly constrain, may include CJK or lowercase
+            import re
+            ocr_answer = re.sub(r'[^A-Za-z0-9]', '', ocr_answer).upper()
 
             debug.log(f"[FUNONE OCR] Result: {ocr_answer} (length: {len(ocr_answer)})")
 
-            # FunOne captcha requires exactly 5 characters
-            if len(ocr_answer) != 5:
-                debug.log(f"[FUNONE OCR] Invalid length: {len(ocr_answer)}, expected 5 chars - please enter manually")
-                # Set failed flag to prevent retry loop
-                funone_dict["ocr_failed"] = True
+            # FunOne captcha is typically 5 characters
+            if len(ocr_answer) < 4 or len(ocr_answer) > 6:
+                debug.log(f"[FUNONE OCR] Invalid length: {len(ocr_answer)}, expected 4-6 chars")
                 return False
 
             # Fill the captcha input
@@ -24495,6 +24765,10 @@ async def nodriver_funone_detect_step(tab):
             if (url.includes('purchase_fill_form')) {
                 // Form filling page
                 return 3;
+            }
+            if (url.includes('purchase_checkout')) {
+                // Payment/checkout page
+                return 4;
             }
 
             // Priority 2: Check URL for step parameter
@@ -24893,6 +25167,10 @@ async def nodriver_funone_main(tab, url, config_dict):
             "last_captcha_type": None,
             "waiting_captcha_printed": False,
             "captcha_filled_printed": False,
+            "ocr_retry_count": 0,
+            "ocr_exhausted": False,
+            "captcha_attempted": False,
+            "checkout_printed": False,
             "next_button_clicked": False,
             # Sold-out refresh tracking
             "refresh_retry_count": 0,
@@ -24931,6 +25209,11 @@ async def nodriver_funone_main(tab, url, config_dict):
         funone_dict["refresh_retry_count"] = 0
         funone_dict["last_sold_out_logged"] = False
         funone_dict["max_retry_logged"] = False
+        # Reset OCR retry state
+        funone_dict["ocr_retry_count"] = 0
+        funone_dict["ocr_exhausted"] = False
+        funone_dict["waiting_captcha_printed"] = False
+        funone_dict["captcha_filled_printed"] = False
 
     # Close popups first
     await nodriver_funone_close_popup(tab)
@@ -25083,34 +25366,35 @@ async def nodriver_funone_main(tab, url, config_dict):
                 captcha_done = await nodriver_funone_captcha_handler(tab, config_dict)
 
                 if captcha_done and qty_set:
-                    # FunOne: Do not auto-submit, let user manually review and submit
-                    print("[FUNONE] Captcha filled, waiting for manual submit")
-                    submit_result = False
-
-                    if submit_result:
-                        # Play order success sound
-                        if not funone_dict.get("played_sound_order", False):
-                            if config_dict["advanced"]["play_sound"]["order"]:
-                                play_sound_while_ordering(config_dict)
-                            send_discord_notification(config_dict, "order", "FunOne")
-                            send_telegram_notification(config_dict, "order", "FunOne")
-                            funone_dict["played_sound_order"] = True
-                        print("[FUNONE] Order submitted successfully!")
+                    # Step 2 captcha filled - submit to proceed
+                    await nodriver_funone_order_submit(tab, config_dict, funone_dict)
 
             elif step >= 3:
-                # Step 3+: Form filling, payment, etc.
-                # Check if we're on the fill form page - this means ticket secured!
+                # Step 3+: Form filling, payment, checkout, complete
                 if 'purchase_fill_form' in url:
+                    # Fill form page - order is already reserved!
+                    # Just need to fill captcha once, then stop.
+                    # User has 10 minutes to complete payment.
                     if not funone_dict.get("played_sound_order", False):
                         if config_dict["advanced"]["play_sound"]["order"]:
                             play_sound_while_ordering(config_dict)
                         send_discord_notification(config_dict, "order", "FunOne")
                         send_telegram_notification(config_dict, "order", "FunOne")
                         funone_dict["played_sound_order"] = True
-                        print("[FUNONE] Reached fill form page - order notification sent!")
+                        debug.log("[FUNONE] Order reserved! Fill captcha then stop.")
 
-                # Handle captcha if present
-                await nodriver_funone_captcha_handler(tab, config_dict)
+                    # Fill captcha once, then stop automation
+                    if not funone_dict.get("captcha_attempted", False):
+                        captcha_done = await nodriver_funone_captcha_handler(tab, config_dict)
+                        if captcha_done:
+                            funone_dict["captcha_attempted"] = True
+                            debug.log("[FUNONE] Captcha filled. Please complete payment within 10 minutes.")
+
+                elif 'purchase_checkout' in url:
+                    # Checkout/payment page - do nothing, wait for user to pay
+                    if not funone_dict.get("checkout_printed", False):
+                        debug.log("[FUNONE] Checkout page reached, waiting for payment...")
+                        funone_dict["checkout_printed"] = True
 
             else:
                 # Unknown step - try area selection first, then quantity
@@ -25150,11 +25434,14 @@ fansigo_dict = {}
 # FANSI GO URL patterns
 FANSIGO_URL_PATTERNS = {
     "domain": r"go\.fansi\.me",
+    "login_page": r"go\.fansi\.me/login",
     "event_page": r"go\.fansi\.me/events/(\d+)",
     "show_page": r"go\.fansi\.me/tickets/show/(\d+)",
     "checkout_page": r"go\.fansi\.me/tickets/payment/checkout/",
     "order_result": r"go\.fansi\.me/tickets/payment/orderresult/",
 }
+
+FANSIGO_COGNITO_DOMAIN = "fansidev.auth.ap-southeast-1.amazoncognito.com"
 
 def is_fansigo_url(url: str) -> bool:
     """Check if URL is a FANSI GO URL"""
@@ -25173,6 +25460,8 @@ def get_fansigo_page_type(url: str) -> str:
     if url is None:
         return "unknown"
 
+    if re.search(FANSIGO_URL_PATTERNS["login_page"], url):
+        return "login"
     if re.search(FANSIGO_URL_PATTERNS["checkout_page"], url):
         return "checkout"
     if re.search(FANSIGO_URL_PATTERNS["order_result"], url):
@@ -25183,6 +25472,58 @@ def get_fansigo_page_type(url: str) -> str:
         return "show"
 
     return "unknown"
+
+def fansigo_normalize_cookie_value(raw_value):
+    """Normalize FansiAuthInfo cookie value to URL-encoded JSON format.
+
+    Handles three input formats:
+    1. URL-encoded JSON (from browser F12 copy) - pass through
+    2. Raw JSON string - auto URL-encode
+    3. Bare JWT token (eyJ...) - wrap in JSON structure and URL-encode
+
+    Returns:
+        tuple: (normalized_value, format_description) or (None, error_msg)
+    """
+    import json
+    from urllib.parse import quote, unquote
+
+    value = raw_value.strip()
+
+    # Strip "FansiAuthInfo=" prefix if user copied full cookie string
+    if value.startswith("FansiAuthInfo="):
+        value = value[len("FansiAuthInfo="):]
+
+    # Case 1: Already URL-encoded JSON
+    if value.startswith("%7B") or value.startswith("%7b"):
+        try:
+            decoded = unquote(value)
+            parsed = json.loads(decoded)
+            if "accessToken" in parsed:
+                return value, "URL-encoded JSON"
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Case 2: Raw JSON
+    if value.startswith("{"):
+        try:
+            parsed = json.loads(value)
+            if "accessToken" in parsed:
+                return quote(value), "raw JSON (auto URL-encoded)"
+        except (json.JSONDecodeError, ValueError):
+            return None, "invalid JSON structure"
+
+    # Case 3: Bare JWT token
+    if value.startswith("eyJ"):
+        auth_info = json.dumps({
+            "__typename": "userToken",
+            "accessToken": value,
+            "tokenLife": 604800
+        })
+        return quote(auth_info), "bare JWT (auto-wrapped)"
+
+    # Unknown format - use as-is
+    return value, "unknown format (as-is)"
+
 
 async def nodriver_fansigo_inject_cookie(tab, config_dict):
     """Inject FansiAuthInfo cookie for FANSI GO login
@@ -25200,26 +25541,138 @@ async def nodriver_fansigo_inject_cookie(tab, config_dict):
     fansigo_cookie = config_dict["accounts"].get("fansigo_cookie", "").strip()
 
     if len(fansigo_cookie) == 0:
-        debug.log("[FANSIGO] No cookie configured, continuing as guest")
-        return True
+        debug.log("[FANSIGO] No cookie configured")
+        return False
+
+    # Normalize cookie format
+    cookie_value, format_desc = fansigo_normalize_cookie_value(fansigo_cookie)
+    if cookie_value is None:
+        debug.log(f"[FANSIGO] Cookie format error: {format_desc}")
+        return False
+
+    debug.log(f"[FANSIGO] Cookie format: {format_desc}")
 
     try:
-        # Set FansiAuthInfo cookie
         await tab.send(cdp.network.set_cookie(
             name="FansiAuthInfo",
-            value=fansigo_cookie,
+            value=cookie_value,
             domain="go.fansi.me",
             path="/",
             secure=True,
-            http_only=True,
+            http_only=False,
         ))
 
         debug.log("[FANSIGO] Cookie injected successfully")
         return True
 
     except Exception as e:
-        print(f"[FANSIGO] Cookie injection failed: {e}")
+        debug.log(f"[FANSIGO] Cookie injection failed: {e}")
         return False
+
+
+async def nodriver_fansigo_signin(tab, url, config_dict):
+    """Handle FANSI GO login page and AWS Cognito authentication.
+
+    Flow:
+    1. On go.fansi.me/login -> click "other method" to redirect to Cognito
+    2. On Cognito hosted UI -> fill email/password and submit
+    3. Cognito redirects back to go.fansi.me with auth code -> app sets cookies
+
+    Args:
+        tab: NoDriver tab
+        url: Current page URL
+        config_dict: Configuration dictionary
+
+    Returns:
+        bool: True if login action was taken
+    """
+    debug = util.create_debug_logger(config_dict)
+
+    fansigo_account = config_dict["accounts"].get("fansigo_account", "").strip()
+    fansigo_password = config_dict["accounts"].get("fansigo_password", "").strip()
+
+    if len(fansigo_account) == 0 or len(fansigo_password) == 0:
+        debug.log("[FANSIGO] No account/password configured, manual login required")
+        return False
+
+    # On FANSI GO login page: click "other method" to go to Cognito
+    if "go.fansi.me/login" in url:
+        try:
+            js_result = await tab.evaluate("""
+                (function() {
+                    const buttons = document.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const text = btn.textContent || '';
+                        if (text.includes('其他方式')) {
+                            btn.click();
+                            return 'clicked';
+                        }
+                    }
+                    return 'not_found';
+                })()
+            """)
+            if js_result == 'clicked':
+                debug.log("[FANSIGO] Clicked 'other login method', redirecting to Cognito")
+            else:
+                debug.log("[FANSIGO] 'Other login method' button not found")
+            return True
+        except Exception as e:
+            debug.log(f"[FANSIGO] Failed to click other login: {e}")
+            return False
+
+    # On Cognito hosted UI: fill email/password and submit
+    if FANSIGO_COGNITO_DOMAIN in url:
+        try:
+            js_result = await tab.evaluate("""
+                (function() {
+                    const emailInput = document.querySelector('#signInFormUsername');
+                    const passInput = document.querySelector('#signInFormPassword');
+                    const submitBtn = document.querySelector('input[name="signInSubmitButton"]');
+                    if (!emailInput || !passInput || !submitBtn) {
+                        return 'form_not_found';
+                    }
+                    if (emailInput.value && passInput.value) {
+                        return 'already_filled';
+                    }
+                    return 'ready';
+                })()
+            """)
+
+            if js_result == 'form_not_found':
+                debug.log("[FANSIGO] Cognito form not found")
+                return False
+
+            if js_result == 'already_filled':
+                debug.log("[FANSIGO] Cognito form already filled, waiting for redirect")
+                return True
+
+            # Fill email
+            email_el = await tab.query_selector('#signInFormUsername')
+            if email_el:
+                await email_el.clear_input()
+                await email_el.send_keys(fansigo_account)
+
+            # Fill password
+            pass_el = await tab.query_selector('#signInFormPassword')
+            if pass_el:
+                await pass_el.clear_input()
+                await pass_el.send_keys(fansigo_password)
+
+            await asyncio.sleep(0.3)
+
+            # Submit
+            submit_el = await tab.query_selector('input[name="signInSubmitButton"]')
+            if submit_el:
+                await submit_el.click()
+                debug.log("[FANSIGO] Cognito login submitted")
+
+            return True
+        except Exception as e:
+            debug.log(f"[FANSIGO] Cognito login failed: {e}")
+            return False
+
+    return False
+
 
 async def nodriver_fansigo_get_shows(tab, config_dict) -> list:
     """Get all available shows from event page using tab.evaluate()
@@ -25394,7 +25847,7 @@ async def nodriver_fansigo_date_auto_select(tab, url, config_dict) -> bool:
             await nodriver_fansigo_click_show(tab, shows[0], config_dict)
             return True
         except Exception as e:
-            print(f"[FANSIGO] Error clicking show: {e}")
+            debug.log(f"[FANSIGO] Error clicking show: {e}")
             return False
 
     # Multiple shows - use keyword matching
@@ -25416,7 +25869,7 @@ async def nodriver_fansigo_date_auto_select(tab, url, config_dict) -> bool:
             await nodriver_fansigo_click_show(tab, matched, config_dict)
             return True
         except Exception as e:
-            print(f"[FANSIGO] Error clicking matched show: {e}")
+            debug.log(f"[FANSIGO] Error clicking matched show: {e}")
             return False
 
     if not date_keyword:
@@ -25429,7 +25882,7 @@ async def nodriver_fansigo_date_auto_select(tab, url, config_dict) -> bool:
                 await nodriver_fansigo_click_show(tab, target, config_dict)
                 return True
             except Exception as e:
-                print(f"[FANSIGO] Error clicking show: {e}")
+                debug.log(f"[FANSIGO] Error clicking show: {e}")
                 return False
         return False
 
@@ -25444,7 +25897,7 @@ async def nodriver_fansigo_date_auto_select(tab, url, config_dict) -> bool:
                 await nodriver_fansigo_click_show(tab, target, config_dict)
                 return True
             except Exception as e:
-                print(f"[FANSIGO] Error clicking fallback show: {e}")
+                debug.log(f"[FANSIGO] Error clicking fallback show: {e}")
                 return False
         return False
 
@@ -25621,7 +26074,7 @@ async def nodriver_fansigo_area_auto_select(tab, url, config_dict) -> int:
             await asyncio.sleep(0.3)
             return section_index
         except Exception as e:
-            print(f"[FANSIGO] Error clicking section: {e}")
+            debug.log(f"[FANSIGO] Error clicking section: {e}")
             return -1
 
     return -1
@@ -25666,7 +26119,7 @@ async def nodriver_fansigo_assign_ticket_number(tab, config_dict, section_index=
             result = util.parse_nodriver_result(result)
             if not (isinstance(result, dict) and result.get('success')):
                 error_msg = result.get('error', 'unknown') if isinstance(result, dict) else 'no_result'
-                print(f"[FANSIGO] Failed to click + button: {error_msg}")
+                debug.log(f"[FANSIGO] Failed to click + button: {error_msg}")
                 return False
             if i < target_count - 1:
                 await asyncio.sleep(0.2)
@@ -25676,7 +26129,7 @@ async def nodriver_fansigo_assign_ticket_number(tab, config_dict, section_index=
         return True
 
     except Exception as e:
-        print(f"[FANSIGO] Error setting ticket quantity: {e}")
+        debug.log(f"[FANSIGO] Error setting ticket quantity: {e}")
         return False
 
 async def nodriver_fansigo_click_checkout(tab, config_dict) -> bool:
@@ -25723,7 +26176,7 @@ async def nodriver_fansigo_click_checkout(tab, config_dict) -> bool:
         return False
 
     except Exception as e:
-        print(f"[FANSIGO] Error clicking checkout: {e}")
+        debug.log(f"[FANSIGO] Error clicking checkout: {e}")
         return False
 
 async def nodriver_fansigo_main(tab, url, config_dict):
@@ -25749,6 +26202,7 @@ async def nodriver_fansigo_main(tab, url, config_dict):
     if 'is_cookie_injected' not in fansigo_dict:
         fansigo_dict = {
             "is_cookie_injected": False,
+            "is_signin_submitted": False,
             "played_sound_ticket": False,
             "last_page_type": None,
             "qty_set_url": None,
@@ -25762,14 +26216,42 @@ async def nodriver_fansigo_main(tab, url, config_dict):
         debug.log(f"[FANSIGO] Page type: {page_type}")
         fansigo_dict["last_page_type"] = page_type
 
-    # Inject cookie (once)
+    # Handle login page - try account login or cookie + reload
+    if page_type == "login":
+        # If cookie was already injected but we're back on login page, cookie may be expired
+        if fansigo_dict["is_cookie_injected"]:
+            debug.log("[FANSIGO] Cookie was injected but login page detected, cookie may be expired")
+            fansigo_dict["is_cookie_injected"] = False
+
+        fansigo_account = config_dict["accounts"].get("fansigo_account", "").strip()
+        fansigo_password = config_dict["accounts"].get("fansigo_password", "").strip()
+
+        if fansigo_account and fansigo_password:
+            if not fansigo_dict.get("is_signin_submitted"):
+                await nodriver_fansigo_signin(tab, url, config_dict)
+                fansigo_dict["is_signin_submitted"] = True
+        elif not fansigo_dict["is_cookie_injected"]:
+            # Try cookie injection then reload
+            injected = await nodriver_fansigo_inject_cookie(tab, config_dict)
+            fansigo_dict["is_cookie_injected"] = True
+            if injected:
+                debug.log("[FANSIGO] Cookie injected on login page, reloading")
+                await tab.reload()
+            else:
+                debug.log("[FANSIGO] No credentials configured, please login manually")
+        return tab
+
+    # Inject cookie (once) for non-login pages
     if not fansigo_dict["is_cookie_injected"]:
         fansigo_dict["is_cookie_injected"] = await nodriver_fansigo_inject_cookie(tab, config_dict)
+        if fansigo_dict["is_cookie_injected"]:
+            debug.log("[FANSIGO] Cookie injected on non-login page, reloading")
+            await tab.reload()
 
     # Handle checkout page - stop automation
     if page_type == "checkout" or page_type == "order_result":
         if not fansigo_dict["played_sound_ticket"]:
-            print("[FANSIGO] Checkout page reached, automation stopped")
+            debug.log("[FANSIGO] Checkout page reached, automation stopped")
             play_mp3 = config_dict.get("advanced", {}).get("play_ticket_sound", True)
             if play_mp3:
                 util.play_mp3_async(config_dict)
@@ -25882,15 +26364,17 @@ async def main(args):
     Captcha_Browser = None
     try:
         if config_dict["ocr_captcha"]["enable"]:
-            ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-            ocr.set_ranges(1)  # Restrict to lowercase letters only (a-z) for TixCraft captchas
+            ocr = create_universal_ocr(config_dict)
+            if ocr is None:
+                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
+                ocr.set_ranges(1)
             Captcha_Browser = NonBrowser()
             if len(config_dict["accounts"]["tixcraft_sid"]) > 1:
                 #set_non_browser_cookies(driver, config_dict["homepage"], Captcha_Browser)
                 pass
     except Exception as exc:
-        print(exc)
-        pass
+        debug = util.create_debug_logger(config_dict)
+        debug.log(f"[OCR INIT] Failed to initialize OCR: {exc}")
 
     maxbot_last_reset_time = time.time()
     is_quit_bot = False
@@ -26070,6 +26554,10 @@ async def main(args):
         # FANSI GO
         if 'go.fansi.me' in url:
             tab = await nodriver_fansigo_main(tab, url, config_dict)
+
+        # FANSI GO Cognito login
+        if FANSIGO_COGNITO_DOMAIN in url:
+            await nodriver_fansigo_signin(tab, url, config_dict)
 
         # for facebook
         facebook_login_url = 'https://www.facebook.com/login.php?'

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026.03.07
+
+- 新增「自訓練模型」OCR 開關，可在設定頁面切換自訓練模型與 ddddocr 官方模型
+- 內建通用 OCR 模型，開啟後自動載入，無需手動設定路徑
+- 新增 FANSI GO 帳號密碼登入功能
+- 新增 FANSI GO Cookie 格式自動偵測，相容多種格式
+- 修復 FANSI GO Cookie 注入後仍被導向登入頁的問題 (Issue #266)
+- 修復票數不足時自動選擇最大可用數量，不再回退為 1 張 (Issue #255)
+- 修復 iBon 售完區域因 CDN 快取過期導致重複跳轉的問題
+
+## 2026.03.05
+
+- 新增 Telegram Bot 通知功能，支援多個聊天室 ID，可在設定頁面直接測試 (PR #264 by @laneser)
+- 改善 Telegram/Discord 通知安全性：Bot Token 欄位改為密碼遮罩、新增格式驗證、錯誤訊息不再洩露敏感資訊
+- 修復 Cloudflare 驗證後誤判的問題，避免重複觸發驗證流程
+- 修復 HK Ticketing 日期選擇邏輯，簡化 type02 處理方式
+- 修復 FunOne 驗證碼流程與結帳頁面處理
+- 移除舊版 config_launcher，簡化建置流程
+
 ## 2026.02.15
 
 - 新增 Cloudflare 驗證頁面自動偵測與處理，避免搶票流程中斷
