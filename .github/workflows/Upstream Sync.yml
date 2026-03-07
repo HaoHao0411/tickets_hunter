@@ -26,6 +26,7 @@ jobs:
                   upstream_sync_branch: main
                   target_sync_branch: main
                   test_mode: false
+                  upstream_pull_args: --allow-unrelated-histories
 
             - name: Check for Failure
               if: failure()
