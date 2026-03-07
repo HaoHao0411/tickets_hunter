@@ -72,18 +72,15 @@ jobs:
 
     - name: 同步 Releases
       run: |
-        # 添加统计变量
         RELEASE_CREATE_SUCCESS=0
         RELEASE_CREATE_FAILURE=0
         RELEASE_SKIP=0
 
-        # 遍历上游所有 Release 按 tag 名称同步
+        latestTag=$(gh release view -R "$UPSTREAM_REPO" --json tagName --jq '.tagName')
+
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
-          # 跳过已有的 Release
           if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
             echo "跳過已存在 Release: $tag"
-            # 檢查上游最新的 release tag
-            latestTag=$(gh release view -R "$UPSTREAM_REPO" --json tagName --jq '.tagName')
             if [ "$tag" = "$latestTag" ]; then
               echo "更新 $tag 為 Latest"
               gh release edit -R $FORK_REPO $tag --prerelease=false --latest
@@ -91,49 +88,49 @@ jobs:
             RELEASE_SKIP=$((RELEASE_SKIP+1))
             continue
           fi
-          
 
           echo "=== 同步 Release: $tag ==="
-          # 下载上游 Release 的所有附件
           gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
 
-          # 获取上游 Release 的元信息
+          # 修正：移除 isLatest（不支援），改用 latestTag 比對
           release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
           title=$(jq -r .name <<<"$release")
           body=$(jq -r .body <<<"$release")
           isPrerelease=$(jq -r .isPrerelease <<<"$release")
-          isLatest=$(jq -r .isLatest <<<"$release")
+
+          # 判斷是否為 latest
+          latestFlag=""
+          if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ]; then
+            latestFlag="--latest"
+          fi
 
           if ! ls $TEMP_DIR/releases/* 1> /dev/null 2>&1; then
-            # 尝试仅同步说明  创建 Release(不带附件)
             if gh release create -R $FORK_REPO $tag \
               --title "$title" \
               --notes "$body" \
-              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); \
-              $( [ "$isLatest" = "true" ] && echo "--latest" ); then
-              RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1)) # 统计成功
+              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ) \
+              $latestFlag; then
+              RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1))
             else
               echo "create Release $tag 失败，跳过"
-              RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1)) # 统计失败
+              RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1))
             fi
           else
-            # 创建 Release
             if gh release create -R $FORK_REPO $tag $TEMP_DIR/releases/* \
               --title "$title" \
               --notes "$body" \
-              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); \
-              $( [ "$isLatest" = "true" ] && echo "--latest" ); then 
-              RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1)) # 统计成功
+              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ) \
+              $latestFlag; then
+              RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1))
             else
               echo "create Release $tag 失败，跳过"
-              RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1)) # 统计失败
+              RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1))
             fi
           fi
 
-          rm -rf $TEMP_DIR $TEMP_DIR/releases/*
+          rm -rf $TEMP_DIR/releases/*
         done
 
-        # 打印统计结果
         echo "===== Releases 同步统计 ====="
         echo "成功: $RELEASE_CREATE_SUCCESS"
         echo "跳过: $RELEASE_SKIP"
