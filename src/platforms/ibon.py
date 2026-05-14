@@ -39,6 +39,8 @@ from nodriver_common import (
 nodriver_ibon_get_captcha_image_from_shadow_dom = nodriver_get_captcha_image_from_dom_snapshot
 
 __all__ = [
+    "register_ibon_alert_handler",
+    "dismiss_pending_ibon_dialog",
     "nodriver_ibon_login",
     "nodriver_ibon_date_auto_select_pierce",
     "nodriver_ibon_date_auto_select",
@@ -60,6 +62,7 @@ __all__ = [
     "nodriver_ibon_navigate_on_sold_out",
     "nodriver_ibon_fill_verify_form",
     "nodriver_ibon_verification_question",
+    "nodriver_ibon_card_vaildate",
     "nodriver_tour_ibon_event_detail",
     "nodriver_tour_ibon_options",
     "nodriver_tour_ibon_checkout",
@@ -68,6 +71,120 @@ __all__ = [
 
 # Module-level state (replaces global ibon_dict)
 _state = {}
+
+
+def _ensure_state():
+    """
+    Initialize _state with all required keys (idempotent).
+
+    Callable from any entry point (main loop, early alert-handler registration)
+    so that touching _state["alert_handler_registered"] before nodriver_ibon_main
+    runs cannot strand the other keys uninitialized.
+    """
+    defaults = {
+        "fail_list": [],
+        "is_popup_checkout": False,
+        "played_sound_order": False,
+        "queue_it_enter_time": None,
+        "shown_checkout_message": False,
+        "alert_handler_registered": False,
+        "livemap_failed_areas": {},
+        "livemap_last_attempt": None,
+        "played_sound_ticket": False,
+        "last_homepage_redirect_time": 0,
+        "vaildate_submitted_url": None,
+    }
+    for key, default in defaults.items():
+        _state.setdefault(key, default)
+
+
+async def register_ibon_alert_handler(tab, config_dict):
+    """
+    Register the global JavaScriptDialogOpening handler for ibon native alerts.
+
+    Idempotent via _state["alert_handler_registered"] -- safe to call from both
+    early (pre-navigation) and lazy (inside nodriver_ibon_main) paths without
+    duplicating handlers, which would cause the same alert to be dispatched
+    multiple times.
+
+    Should be called BEFORE navigating to ibon homepage so the handler is
+    attached when window.alert(...) fires on page load (e.g. ibon's
+    "會員登入方式調整" notice that appears on every visit to ticket.ibon.com.tw).
+    """
+    debug = util.create_debug_logger(config_dict)
+    _ensure_state()
+
+    if _state["alert_handler_registered"]:
+        return
+
+    async def handle_ibon_alert(event):
+        # Skip alert handling when bot is paused (let user handle manually)
+        if os.path.exists(CONST_MAXBOT_INT28_FILE):
+            return
+
+        # On checkout page, only auto-dismiss known sold-out/failure alerts.
+        # Payment confirmations and other critical prompts require user action.
+        current_url = tab.target.url if (tab and hasattr(tab, 'target') and tab.target) else ""
+        if '/utk02/utk0206_' in current_url.lower():
+            checkout_safe_keywords = [
+                "已售完", "售完", "別人搶先一步", "已無可配座位",
+                "無可配座位", "已被購買",
+            ]
+            is_safe_to_dismiss = any(kw in event.message for kw in checkout_safe_keywords)
+            if not is_safe_to_dismiss:
+                debug.log(f"[IBON ALERT] Alert on checkout page, NOT auto-dismissing: '{event.message}'")
+                return
+            debug.log(f"[IBON ALERT] Checkout page sold-out/failure alert, auto-dismissing: '{event.message}'")
+
+        debug.log(f"[IBON ALERT] Alert detected: '{event.message}'")
+
+        # Dismiss the alert - try multiple times with small delays
+        for attempt in range(3):
+            try:
+                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+                debug.log(f"[IBON ALERT] Alert dismissed (attempt {attempt + 1})")
+                break
+            except Exception as dismiss_exc:
+                error_msg = str(dismiss_exc)
+                # CDP -32602 means no dialog is showing (already dismissed by local handler)
+                if "No dialog is showing" in error_msg or "-32602" in error_msg:
+                    debug.log("[IBON ALERT] Dialog already dismissed")
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.1)
+                else:
+                    debug.log(f"[IBON ALERT] Failed to dismiss alert: {dismiss_exc}")
+
+    try:
+        tab.add_handler(cdp.page.JavascriptDialogOpening, handle_ibon_alert)
+        _state["alert_handler_registered"] = True
+        debug.log("[IBON ALERT] Global alert handler registered")
+    except Exception as handler_exc:
+        debug.log(f"[IBON ALERT][DEGRADED] Failed to register alert handler: {handler_exc}")
+        debug.log("[IBON ALERT][DEGRADED] ibon homepage alerts will NOT be auto-dismissed until next retry")
+
+
+async def dismiss_pending_ibon_dialog(tab, config_dict):
+    """
+    Proactively dismiss a JS dialog that is already open on the page.
+
+    Backstop for alerts that fire BEFORE register_ibon_alert_handler attaches:
+    ibon's homepage onload notice fires during driver.get(), so the
+    JavaScriptDialogOpening event has already been dispatched (and missed)
+    by the time any handler is registered. Calling this after navigation
+    completes clears that stuck dialog.
+
+    No-op if no dialog is currently showing.
+    """
+    debug = util.create_debug_logger(config_dict)
+    try:
+        await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+        debug.log("[IBON ALERT] Pending dialog dismissed proactively")
+    except Exception as exc:
+        msg = str(exc)
+        if "No dialog is showing" in msg or "-32602" in msg:
+            return
+        debug.log(f"[IBON ALERT] Proactive dismiss failed: {exc}")
 
 
 async def nodriver_ibon_login(tab, config_dict, driver):
@@ -3166,6 +3283,98 @@ async def nodriver_ibon_fill_verify_form(tab, config_dict, answer_list, fail_lis
 
     return is_answer_sent, fail_list
 
+async def nodriver_ibon_card_vaildate(tab, config_dict):
+    """
+    Handle ibon cardholder-priority validation page (/Vaildate/...).
+    Fills credit card prefix and submits to proceed to Event page.
+    Primary source: credit_card_prefix; fallback: first token of user_guess_string.
+    """
+    debug = util.create_debug_logger(config_dict)
+
+    current_url = tab.target.url if (tab and hasattr(tab, 'target') and tab.target) else ""
+
+    # Re-entry guard: avoid re-submitting before navigation completes
+    if _state.get("vaildate_submitted_url") == current_url:
+        debug.log("[IBON VAILDATE] Already submitted for this URL, skipping")
+        return False
+
+    prefix = config_dict.get("contact", {}).get("credit_card_prefix", "").strip()
+    if not prefix:
+        guess = config_dict.get("advanced", {}).get("user_guess_string", "").strip()
+        if guess:
+            prefix = guess.split(",")[0].strip().strip('"')
+
+    if not prefix:
+        debug.log("[IBON VAILDATE] No credit_card_prefix configured, waiting for manual input")
+        return False
+
+    INPUT_CSS = "#content input[type='text']"
+    SUBMIT_BTN_CSS = "#content a.btn"
+    prefix_js = json.dumps(prefix)
+
+    try:
+        has_input = await tab.evaluate(f'''
+            (function() {{
+                return document.querySelector("{INPUT_CSS}") !== null;
+            }})()
+        ''')
+        if not has_input:
+            debug.log("[IBON VAILDATE] Input field not found yet")
+            return False
+
+        # Skip if already filled (page may have re-rendered)
+        current_val = await tab.evaluate(f'''
+            (function() {{
+                var el = document.querySelector("{INPUT_CSS}");
+                return el ? el.value : "";
+            }})()
+        ''')
+        if current_val and str(current_val).strip():
+            debug.log(f"[IBON VAILDATE] Input already has value, skipping")
+            return False
+
+        # Use Angular-compatible prototype setter so ngModel picks up the change
+        fill_ok = await tab.evaluate(f'''
+            (function() {{
+                var input = document.querySelector("{INPUT_CSS}");
+                if (!input) return false;
+                var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                setter.call(input, {prefix_js});
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return input.value === {prefix_js};
+            }})()
+        ''')
+
+        if not fill_ok:
+            debug.log(f"[IBON VAILDATE] Failed to fill input")
+            return False
+
+        debug.log(f"[IBON VAILDATE] Filled prefix (length: {len(prefix)})")
+
+        # Click via JS so Angular (click) handler fires (button is <a>, not <button>)
+        clicked = await tab.evaluate(f'''
+            (function() {{
+                var btn = document.querySelector("{SUBMIT_BTN_CSS}");
+                if (!btn) return false;
+                btn.click();
+                return true;
+            }})()
+        ''')
+
+        if clicked:
+            _state["vaildate_submitted_url"] = current_url
+            debug.log("[IBON VAILDATE] Submitted, waiting for navigation")
+            await asyncio.sleep(1.5)
+            return True
+
+        debug.log("[IBON VAILDATE] Submit button not found")
+        return False
+
+    except Exception as exc:
+        debug.log(f"[IBON VAILDATE] Error: {exc}")
+        return False
+
 async def nodriver_ibon_verification_question(tab, fail_list, config_dict):
     """
     Handle verification question on ibon with auto-fill support
@@ -3634,62 +3843,13 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
     # 函數開始時檢查暫停
     if await check_and_handle_pause(config_dict):
         return False
-    if not _state:
-        _state.update({
-            "fail_list": [],
-            "is_popup_checkout": False,
-            "played_sound_order": False,
-            "queue_it_enter_time": None,
-            "shown_checkout_message": False,
-            "alert_handler_registered": False,
-            "livemap_failed_areas": {},
-            "livemap_last_attempt": None,
-            "played_sound_ticket": False,
-            "last_homepage_redirect_time": 0,
-        })
+    _ensure_state()
 
     # Check if kicked to login page (Cookie/Session expired)
     debug = util.create_debug_logger(config_dict)
 
-    # Global alert handler - auto-dismiss iBon alerts (sold-out, errors, etc.)
-    async def handle_ibon_alert(event):
-        # Skip alert handling when bot is paused (let user handle manually)
-        if os.path.exists(CONST_MAXBOT_INT28_FILE):
-            return
-
-        # Skip checkout page - let user handle important alerts manually
-        current_url = tab.target.url if (tab and hasattr(tab, 'target') and tab.target) else ""
-        if '/utk02/utk0206_' in current_url.lower():
-            debug.log(f"[IBON ALERT] Alert on checkout page, NOT auto-dismissing: '{event.message}'")
-            return
-
-        debug.log(f"[IBON ALERT] Alert detected: '{event.message}'")
-
-        # Dismiss the alert - try multiple times with small delays
-        for attempt in range(3):
-            try:
-                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
-                debug.log(f"[IBON ALERT] Alert dismissed (attempt {attempt + 1})")
-                break
-            except Exception as dismiss_exc:
-                error_msg = str(dismiss_exc)
-                # CDP -32602 means no dialog is showing (already dismissed by local handler)
-                if "No dialog is showing" in error_msg or "-32602" in error_msg:
-                    debug.log("[IBON ALERT] Dialog already dismissed")
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(0.1)
-                else:
-                    debug.log(f"[IBON ALERT] Failed to dismiss alert: {dismiss_exc}")
-
-    # Register global alert handler (only once per session)
-    if not _state.get("alert_handler_registered", False):
-        try:
-            tab.add_handler(cdp.page.JavascriptDialogOpening, handle_ibon_alert)
-            _state["alert_handler_registered"] = True
-            debug.log("[IBON ALERT] Global alert handler registered")
-        except Exception as handler_exc:
-            debug.log(f"[IBON ALERT] Failed to register alert handler: {handler_exc}")
+    # Lazy-register alert handler (no-op if already registered by goto_homepage)
+    await register_ibon_alert_handler(tab, config_dict)
 
     # Queue-IT detection: track enter/exit time for diagnostics
     url_lower = url.lower()
@@ -3742,23 +3902,18 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
             else:
                 debug.log(f"[IBON LOGIN] Re-authentication failed: {login_result.get('error', 'Unknown error')}")
 
-        # Redirect back to target URL or homepage
-        if target_url and target_url.startswith('http'):
-            debug.log(f"[IBON LOGIN] Redirecting to target: {target_url}")
-            try:
-                await tab.get(target_url)
-                await asyncio.sleep(2)
-            except Exception as e:
-                debug.log(f"[IBON LOGIN] Redirect failed: {e}")
-        else:
-            # No target URL, go to homepage
-            config_homepage = config_dict["homepage"]
-            debug.log(f"[IBON LOGIN] No target URL, redirecting to homepage: {config_homepage}")
-            try:
-                await tab.get(config_homepage)
-                await asyncio.sleep(2)
-            except Exception as e:
-                debug.log(f"[IBON LOGIN] Homepage redirect failed: {e}")
+        # Navigate to ticket.ibon.com.tw homepage so the server can process the
+        # cookie and establish a session. Do NOT navigate to target_url (/login)
+        # directly -- that SSO endpoint redirects back to huiwan when there is
+        # no existing session, causing an infinite redirect loop.
+        ibon_base = "https://ticket.ibon.com.tw/"
+        debug.log(f"[IBON LOGIN] Navigating to ibon base URL to activate cookie session")
+        try:
+            await tab.get(ibon_base)
+            await asyncio.sleep(random.uniform(1.5, 2.0))
+            await dismiss_pending_ibon_dialog(tab, config_dict)
+        except Exception as e:
+            debug.log(f"[IBON LOGIN] Navigation to ibon base failed: {e}")
 
         return False  # Don't quit bot, continue monitoring
 
@@ -3882,6 +4037,16 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
             is_enter_verify_mode = True
             _state["fail_list"] = await nodriver_ibon_verification_question(tab, _state["fail_list"], config_dict)
             is_match_target_feature = True
+
+    if not is_match_target_feature:
+        # Cardholder-priority validation page: ticket.ibon.com.tw/Vaildate/{eventId}/{sessionId}/{activityId}
+        # (Note: "Vaildate" is ibon's own typo in the URL)
+        if 'ticket.ibon.com.tw' in url_lower and '/vaildate/' in url_lower:
+            is_enter_verify_mode = True
+            await nodriver_ibon_card_vaildate(tab, config_dict)
+            is_match_target_feature = True
+        elif _state.get("vaildate_submitted_url") is not None:
+            _state["vaildate_submitted_url"] = None
 
     if not is_enter_verify_mode:
         _state["fail_list"] = []
