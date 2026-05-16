@@ -71,7 +71,7 @@ jobs:
           fi
         fi
 
-     - name: 同步 Releases
+    - name: 同步 Releases
       run: |
         RELEASE_CREATE_SUCCESS=0
         RELEASE_CREATE_FAILURE=0
