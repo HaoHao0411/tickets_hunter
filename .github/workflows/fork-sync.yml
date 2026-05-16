@@ -89,17 +89,12 @@ jobs:
             # 更新 body 和 prerelease 狀態
             if [ "$isPrerelease" = "true" ]; then
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease
+            elif [ "$tag" = "$latestTag" ]; then
+              echo "更新 $tag 為 Latest"
+              gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false --latest
             else
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false
             fi
-                # 如果是 latest 也一併更新
-            if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ]; then
-              echo "更新 $tag 為 Latest"
-              gh release edit -R $FORK_REPO $tag --latest
-            fi
-            RELEASE_SKIP=$((RELEASE_SKIP+1))
-            continue
-          fi
 
           echo "=== 同步 Release: $tag ==="
           gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
