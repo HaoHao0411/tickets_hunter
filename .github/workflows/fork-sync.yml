@@ -85,9 +85,12 @@ jobs:
             release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
             body=$(jq -r .body <<<"$release")
             isPrerelease=$(jq -r .isPrerelease <<<"$release")
+            isDraft=$(jq -r .isDraft <<<"$release")
 
             if [ "$isPrerelease" = "true" ]; then
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease
+            elif [ "$isDraft" = "true" ]; then
+              gh release edit -R $FORK_REPO $tag --notes "$body" --draft
             elif [ "$tag" = "$latestTag" ]; then
               echo "更新 $tag 為 Latest"
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false --latest
@@ -106,6 +109,7 @@ jobs:
           title=$(jq -r .name <<<"$release")
           body=$(jq -r .body <<<"$release")
           isPrerelease=$(jq -r .isPrerelease <<<"$release")
+          isDraft=$(jq -r .isDraft <<<"$release")
 
           latestFlag=""
           if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ]; then
@@ -117,6 +121,7 @@ jobs:
               --title "$title" \
               --notes "$body" \
               $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ) \
+              $( [ "$isDraft" = "true" ] && echo "--draft" ) \
               $latestFlag; then
               RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1))
             else
@@ -128,6 +133,7 @@ jobs:
               --title "$title" \
               --notes "$body" \
               $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ) \
+              $( [ "$isDraft" = "true" ] && echo "--draft" ) \
               $latestFlag; then
               RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1))
             else
