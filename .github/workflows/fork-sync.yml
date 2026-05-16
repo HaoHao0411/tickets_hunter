@@ -71,7 +71,7 @@ jobs:
           fi
         fi
 
-    - name: 同步 Releases
+     - name: 同步 Releases
       run: |
         RELEASE_CREATE_SUCCESS=0
         RELEASE_CREATE_FAILURE=0
@@ -82,11 +82,10 @@ jobs:
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
           if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
             echo "跳過已存在 Release: $tag"
-            # 同步上游的最新 body 和 prerelease 狀態
             release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
             body=$(jq -r .body <<<"$release")
             isPrerelease=$(jq -r .isPrerelease <<<"$release")
-            # 更新 body 和 prerelease 狀態
+
             if [ "$isPrerelease" = "true" ]; then
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease
             elif [ "$tag" = "$latestTag" ]; then
@@ -96,16 +95,18 @@ jobs:
               gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false
             fi
 
+            RELEASE_SKIP=$((RELEASE_SKIP+1))
+            continue
+          fi
+
           echo "=== 同步 Release: $tag ==="
           gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
 
-          # 修正：移除 isLatest（不支援），改用 latestTag 比對
           release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
           title=$(jq -r .name <<<"$release")
           body=$(jq -r .body <<<"$release")
           isPrerelease=$(jq -r .isPrerelease <<<"$release")
 
-          # 判斷是否為 latest
           latestFlag=""
           if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ]; then
             latestFlag="--latest"
