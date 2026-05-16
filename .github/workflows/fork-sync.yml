@@ -82,7 +82,7 @@ jobs:
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
           if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
             echo "跳過已存在 Release: $tag"
-            release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
+            release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
             body=$(jq -r .body <<<"$release")
             isPrerelease=$(jq -r .isPrerelease <<<"$release")
             isDraft=$(jq -r .isDraft <<<"$release")
@@ -105,7 +105,7 @@ jobs:
           echo "=== 同步 Release: $tag ==="
           gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
 
-          release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease)
+          release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
           title=$(jq -r .name <<<"$release")
           body=$(jq -r .body <<<"$release")
           isPrerelease=$(jq -r .isPrerelease <<<"$release")
