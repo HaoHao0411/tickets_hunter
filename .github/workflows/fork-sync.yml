@@ -80,39 +80,42 @@ jobs:
         latestTag=$(gh release list -R "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
 
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
-          if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
-            echo "跳過已存在 Release: $tag"
-            release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
-            body=$(jq -r .body <<<"$release")
-            isPrerelease=$(jq -r .isPrerelease <<<"$release")
-            isDraft=$(jq -r .isDraft <<<"$release")
 
-            if [ "$isPrerelease" = "true" ]; then
-              gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease
-            elif [ "$isDraft" = "true" ]; then
-              gh release edit -R $FORK_REPO $tag --notes "$body" --draft
-            elif [ "$tag" = "$latestTag" ]; then
-              echo "更新 $tag 為 Latest"
-              gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false --latest
-            else
-              gh release edit -R $FORK_REPO $tag --notes "$body" --prerelease=false
+          if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
+            # 抓上游資料
+            upstream=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
+            upstream_body=$(jq -r .body <<<"$upstream")
+            upstream_isPrerelease=$(jq -r .isPrerelease <<<"$upstream")
+            upstream_isDraft=$(jq -r .isDraft <<<"$upstream")
+
+            # 抓自己 fork 的資料
+            fork=$(gh release view -R "$FORK_REPO" "$tag" --json body,isPrerelease,isDraft)
+            fork_body=$(jq -r .body <<<"$fork")
+            fork_isPrerelease=$(jq -r .isPrerelease <<<"$fork")
+            fork_isDraft=$(jq -r .isDraft <<<"$fork")
+
+            # 比較是否有差異
+            if [ "$upstream_body" = "$fork_body" ] && [ "$upstream_isPrerelease" = "$fork_isPrerelease" ] && [ "$upstream_isDraft" = "$fork_isDraft" ]; then
+              echo "跳過無差異 Release: $tag"
+              RELEASE_SKIP=$((RELEASE_SKIP+1))
+              continue
             fi
 
-            RELEASE_SKIP=$((RELEASE_SKIP+1))
-            continue
+            echo "發現差異，刪除並重新同步 Release: $tag"
+            gh release delete -R $FORK_REPO $tag --yes
           fi
 
           echo "=== 同步 Release: $tag ==="
           gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
 
-          release=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
-          title=$(jq -r .name <<<"$release")
-          body=$(jq -r .body <<<"$release")
-          isPrerelease=$(jq -r .isPrerelease <<<"$release")
-          isDraft=$(jq -r .isDraft <<<"$release")
+          upstream=$(gh release view -R "$UPSTREAM_REPO" "$tag" --json name,body,isPrerelease,isDraft)
+          title=$(jq -r .name <<<"$upstream")
+          body=$(jq -r .body <<<"$upstream")
+          isPrerelease=$(jq -r .isPrerelease <<<"$upstream")
+          isDraft=$(jq -r .isDraft <<<"$upstream")
 
           latestFlag=""
-          if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ]; then
+          if [ "$tag" = "$latestTag" ] && [ "$isPrerelease" = "false" ] && [ "$isDraft" = "false" ]; then
             latestFlag="--latest"
           fi
 
