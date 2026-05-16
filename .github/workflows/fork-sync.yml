@@ -77,7 +77,7 @@ jobs:
         RELEASE_CREATE_FAILURE=0
         RELEASE_SKIP=0
 
-        latestTag=$(gh release view -R "$UPSTREAM_REPO" --json tagName --jq '.tagName')
+        latestTag=$(gh release list -R "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
 
         for tag in $(gh release list -R "$UPSTREAM_REPO" --limit "$RELEASE_LIMIT" --json tagName --jq '.[].tagName' | tac); do
           if gh release view -R $FORK_REPO $tag > /dev/null 2>&1; then
